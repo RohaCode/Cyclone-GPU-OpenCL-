@@ -130,10 +130,16 @@ static inline bool compressedPrefixMatches(uint256_t x, uint256_t y, __constant 
         return false;
     }
 
-    for(int i = 0; i < prefixLen - 1; i++) {
-        uchar xb = (uchar)((x.v[i / 4] >> ((3 - (i & 3)) * 8)) & 0xff);
-        if(xb != target[i + 1]) {
-            return false;
+    if(prefixLen > 1) {
+        // Check first 4 bytes of X (excluding parity)
+        unsigned int targetX0 = ((unsigned int)target[1] << 24) | ((unsigned int)target[2] << 16) | ((unsigned int)target[3] << 8) | (unsigned int)target[4];
+        if(x.v[0] != targetX0) return false;
+        
+        for(int i = 4; i < prefixLen - 1; i++) {
+            uchar xb = (uchar)((x.v[i / 4] >> ((3 - (i & 3)) * 8)) & 0xff);
+            if(xb != target[i + 1]) {
+                return false;
+            }
         }
     }
 
@@ -349,9 +355,11 @@ __kernel void cyclone_search_gpu(
     }
 }
 
+#define BATCH_SIZE 1024
+
 __kernel void cyclone_check_batch_thread_gpu(
     __global const uint256_t* baseKeys,
-    __global const point_affine_t* gTable,
+    __constant const point_affine_t* gTable,
     __constant const uchar* targetPrefix,
     const int prefixLen,
     __global const point_affine_t* startPoints,
@@ -360,6 +368,7 @@ __kernel void cyclone_check_batch_thread_gpu(
 {
     const int gid = get_global_id(0);
     const int dim = get_global_size(0);
+
     uint256_t baseKey = baseKeys[gid];
     uint256_t startX = startPoints[gid].x;
     uint256_t startY = startPoints[gid].y;
@@ -367,52 +376,57 @@ __kernel void cyclone_check_batch_thread_gpu(
 
     uint256_t inverse = one256();
 
-    for(int i = 1; i < 256; i++) {
+    // Pass 1: Forward pass to build the chain
+    #pragma unroll 2
+    for(int i = 1; i < BATCH_SIZE; i++) {
         point_affine_t offsetPoint = gTable[i - 1];
         uint256_t denom = subModP256k(offsetPoint.x, startX);
         uint256_t factor = equal256k(denom, zero256()) ? one256() : denom;
-        inverse = mulModP256k_fast(inverse, factor);
+        inverse = mulModP256k(inverse, factor);
         chain[(i - 1) * dim + gid] = inverse;
     }
 
+    // Pass 2: Individual Inversion
     inverse = invModP256k(inverse);
 
     if(result->flag == 2) {
         return;
     }
 
-    for(int i = 255; i >= 1; i--) {
+    // Pass 3: Backward pass to find the points
+    #pragma unroll 2
+    for(int i = BATCH_SIZE - 1; i >= 1; i--) {
         point_affine_t offsetPoint = gTable[i - 1];
         uint256_t invDenom;
         uint256_t denom = subModP256k(offsetPoint.x, startX);
         uint256_t factor = equal256k(denom, zero256()) ? one256() : denom;
 
         if(i > 1) {
-            invDenom = mulModP256k_fast(inverse, chain[(i - 2) * dim + gid]);
-            inverse = mulModP256k_fast(inverse, factor);
+            invDenom = mulModP256k(inverse, chain[(i - 2) * dim + gid]);
+            inverse = mulModP256k(inverse, factor);
         } else {
             invDenom = inverse;
         }
 
         uint256_t rise = subModP256k(offsetPoint.y, startY);
-        uint256_t slope = mulModP256k_fast(rise, invDenom);
-        uint256_t slopeSq = squareModP256k_fast(slope);
+        uint256_t slope = mulModP256k(rise, invDenom);
+        uint256_t slopeSq = mulModP256k(slope, slope);
         uint256_t plusX = subModP256k(subModP256k(slopeSq, startX), offsetPoint.x);
 
         if(prefixLen == 1 || xPrefixMatches(plusX, targetPrefix, prefixLen)) {
-            uint256_t plusY = addModP256k(negStartY, mulModP256k_fast(slope, subModP256k(startX, plusX)));
+            uint256_t plusY = addModP256k(negStartY, mulModP256k(slope, subModP256k(startX, plusX)));
             if(compressedPrefixMatches(plusX, plusY, targetPrefix, prefixLen)) {
                 storeMatchResult(addSmall256(baseKey, (unsigned int)i), plusX, plusY, targetPrefix, result);
             }
         }
 
         rise = negModP256k(addModP256k(offsetPoint.y, startY));
-        slope = mulModP256k_fast(rise, invDenom);
-        slopeSq = squareModP256k_fast(slope);
+        slope = mulModP256k(rise, invDenom);
+        slopeSq = mulModP256k(slope, slope);
         uint256_t minusX = subModP256k(subModP256k(slopeSq, startX), offsetPoint.x);
 
         if(prefixLen == 1 || xPrefixMatches(minusX, targetPrefix, prefixLen)) {
-            uint256_t minusY = addModP256k(negStartY, mulModP256k_fast(slope, subModP256k(startX, minusX)));
+            uint256_t minusY = addModP256k(negStartY, mulModP256k(slope, subModP256k(startX, minusX)));
             if(compressedPrefixMatches(minusX, minusY, targetPrefix, prefixLen)) {
                 storeMatchResult(subSmall256(baseKey, (unsigned int)i), minusX, minusY, targetPrefix, result);
             }

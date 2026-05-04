@@ -13,7 +13,7 @@ ifeq ($(OS),Windows_NT)
     OPENCL_PATH ?= ./OpenCL
     TARGET = cyclone_gpu.exe
     CXXFLAGS = $(COMMON_FLAGS) -static -I"$(OPENCL_PATH)/include"
-    LDFLAGS = -L"$(OPENCL_PATH)/lib/x86_64" -lOpenCL
+    LDFLAGS = -L"$(OPENCL_PATH)/lib/x86_64" -lOpenCL -static -Wl,--stack,8388608
     CLEAN = powershell -NoProfile -Command "Remove-Item -Force -ErrorAction SilentlyContinue *.o, '$(TARGET)'"
 else
     TARGET = cyclone_gpu

@@ -181,7 +181,7 @@ Range         : 400000000:7FFFFFFFF
 Batches/loop  : 65536
 Checked/loop  : 33554432
 Search started.
-Time          : 00:42 | Speed: 1029.00 Mkeys/s | Total: 43285217280
+Time          : 00:03 | Speed: 1667.73 Mkeys/s | Total: 43285217280
 ================== PARTIAL MATCH FOUND! ============
 Prefix bytes  : 4
 Private Key   : 00000000000000000000000000000000000000000000000000000004ddb7e1bc

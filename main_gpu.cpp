@@ -17,6 +17,7 @@
 #include "Int.h"
 #include "Point.h"
 #include "SECP256K1.h"
+#include <memory>
 
 typedef struct { unsigned int v[8]; } uint256_gpu_t;
 typedef struct { uint256_gpu_t x, y; } point_affine_gpu_t;
@@ -286,7 +287,7 @@ int main(int argc, char* argv[]) {
         bool selfTest = false;
         int benchLoops = 0;
         int profileLoops = 0;
-        size_t globalWorkSize = 262144;
+        size_t globalWorkSize = 16384;
 
         for(int i = 1; i < argc; i++) {
             if(!std::strcmp(argv[i], "-k") && i + 1 < argc) {
@@ -360,12 +361,24 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "Preparing CPU : GTable\n" << std::flush;
-        Secp256K1 secp;
-        secp.Init();
+        auto secp = std::make_unique<Secp256K1>();
+        secp->Init();
+        
+        // 1. Full GTable for initial points (32 * 256 points)
         std::vector<point_affine_gpu_t> gpuGTable(32 * 256);
         for(int i = 0; i < 32 * 256; i++) {
-            intToGpu(secp.GTable[i].x, gpuGTable[i].x);
-            intToGpu(secp.GTable[i].y, gpuGTable[i].y);
+            intToGpu(secp->GTable[i].x, gpuGTable[i].x);
+            intToGpu(secp->GTable[i].y, gpuGTable[i].y);
+        }
+
+        // 2. Fast BatchTable for stepping (1024 points: 1G, 2G, ..., 1024G)
+        const size_t batchWidth = 1024;
+        std::vector<point_affine_gpu_t> gpuBatchTable(batchWidth);
+        for(size_t i = 0; i < batchWidth; i++) {
+            Int idx((uint64_t)(i + 1));
+            Point nextP = secp->ComputePublicKey(&idx);
+            intToGpu(nextP.x, gpuBatchTable[i].x);
+            intToGpu(nextP.y, gpuBatchTable[i].y);
         }
 
         cl_int err = CL_SUCCESS;
@@ -387,7 +400,7 @@ int main(int argc, char* argv[]) {
         cl_program program = clCreateProgramWithSource(context, 1, &srcPtr, &srcLen, &err);
         checkCl(err, "clCreateProgramWithSource");
 
-        err = clBuildProgram(program, 1, &device, "-I .", nullptr, nullptr);
+        err = clBuildProgram(program, 1, &device, "-I . -cl-mad-enable -cl-fast-relaxed-math", nullptr, nullptr);
         if(err != CL_SUCCESS) {
             size_t logSize = 0;
             clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
@@ -416,7 +429,6 @@ int main(int argc, char* argv[]) {
         }
 
         const size_t groupsPerLaunch = globalWorkSize;
-        const size_t batchWidth = 256;
         const size_t checkedPerGroup = batchWidth * 2;
         std::vector<xoshiro_state_gpu_t> rngStates(groupsPerLaunch);
         uint64_t seedBase = ((uint64_t)std::random_device{}() << 32) ^ (uint64_t)std::random_device{}();
@@ -440,6 +452,9 @@ int main(int argc, char* argv[]) {
         cl_mem bufGTable = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                           sizeof(point_affine_gpu_t) * gpuGTable.size(), gpuGTable.data(), &err);
         checkCl(err, "clCreateBuffer gTable");
+        cl_mem bufBatchTable = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                          sizeof(point_affine_gpu_t) * gpuBatchTable.size(), gpuBatchTable.data(), &err);
+        checkCl(err, "clCreateBuffer batchTable");
         cl_mem bufPrefix = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                           targetPrefix.size(), targetPrefix.data(), &err);
         checkCl(err, "clCreateBuffer targetPrefix");
@@ -471,20 +486,20 @@ int main(int argc, char* argv[]) {
         checkCl(clSetKernelArg(startKernel, 5, sizeof(cl_mem), &bufResult), "clSetKernelArg start 5");
 
         checkCl(clSetKernelArg(threadBatchKernel, 0, sizeof(cl_mem), &bufKeys), "clSetKernelArg thread batch 0");
-        checkCl(clSetKernelArg(threadBatchKernel, 1, sizeof(cl_mem), &bufGTable), "clSetKernelArg thread batch 1");
+        checkCl(clSetKernelArg(threadBatchKernel, 1, sizeof(cl_mem), &bufBatchTable), "clSetKernelArg thread batch 1");
         checkCl(clSetKernelArg(threadBatchKernel, 2, sizeof(cl_mem), &bufPrefix), "clSetKernelArg thread batch 2");
         checkCl(clSetKernelArg(threadBatchKernel, 3, sizeof(int), &prefixLen), "clSetKernelArg thread batch 3");
         checkCl(clSetKernelArg(threadBatchKernel, 4, sizeof(cl_mem), &bufStartPoints), "clSetKernelArg thread batch 4");
         checkCl(clSetKernelArg(threadBatchKernel, 5, sizeof(cl_mem), &bufResult), "clSetKernelArg thread batch 5");
         checkCl(clSetKernelArg(threadBatchKernel, 6, sizeof(cl_mem), &bufThreadChain), "clSetKernelArg thread batch 6");
 
-        size_t localWorkSize = batchWidth;
+        size_t localWorkSize = 256;
 
         if(selfTest) {
             std::cout << "Selftest      : CPU expected\n";
             for(int k = 1; k <= 3; k++) {
                 Int key((uint64_t)k);
-                Point p = secp.ComputePublicKey(&key);
+                Point p = secp->ComputePublicKey(&key);
                 std::cout << "  CPU " << k << " : " << pointToCompressedHex(p) << "\n";
             }
 
@@ -705,7 +720,7 @@ int main(int argc, char* argv[]) {
                 const std::string privHex = gpuToHex(result.privKey);
                 const std::string pubHex = pointToCompressedHex(result.x, result.y);
                 Int verifyKey = hexToInt(privHex);
-                Point verifyPoint = secp.ComputePublicKey(&verifyKey);
+                Point verifyPoint = secp->ComputePublicKey(&verifyKey);
                 const std::string cpuPubHex = pointToCompressedHex(verifyPoint);
 
                 if(cpuPubHex != pubHex) {
