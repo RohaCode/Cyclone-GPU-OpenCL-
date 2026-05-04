@@ -50,8 +50,6 @@ static inline ulong xoshiro_next(__global xoshiro_state_t* state)
 
 static inline unsigned int getKeyByte(uint256_t key, int byteIndex)
 {
-    // Scalar logic: v[7] is MSB word, v[0] is LSB word.
-    // Each word is Little-Endian bytes: byte 0 is (v >> 0)
     return (key.v[7 - (byteIndex / 4)] >> ((byteIndex & 3) * 8)) & 0xff;
 }
 
@@ -155,34 +153,37 @@ static inline uint256_t randomMasked256(__global xoshiro_state_t* state, uint256
 
 static inline bool compressedPrefixMatches(uint256_t x, uint256_t y, __constant const uchar* target, int prefixLen)
 {
-    // 1. Check parity byte (target[0])
     uchar parity = (y.v[7] & 1) ? (uchar)0x03 : (uchar)0x02;
     if(parity != target[0]) return false;
 
-    // 2. Check X bytes if prefixLen > 1
     for(int i = 0; i < prefixLen - 1; i++) {
         int wordIdx = i / 4;
-        int byteInWord = i % 4; // 0=MSB, 3=LSB within word
-        // Coordinate logic: v[0] is MSB word, each word is Big-Endian
+        int byteInWord = i % 4;
         uchar xb = (uchar)((x.v[wordIdx] >> ((3 - byteInWord) * 8)) & 0xff);
         if(xb != target[i + 1]) return false;
     }
     return true;
 }
 
-static inline bool xPrefixMatches(uint256_t x, __constant const uchar* target, int prefixLen)
+// Optimized fast filter for first word
+static inline bool xPrefixMatchesFast(uint256_t x, uint targetWord)
+{
+    return x.v[0] == targetWord;
+}
+
+static inline bool xPrefixMatchesFull(uint256_t x, __constant const uchar* target, int prefixLen)
 {
     int xBytes = prefixLen - 1;
     int fullWords = xBytes / 4;
     int tailBytes = xBytes & 3;
 
-    for(int i = 0; i < fullWords; i++) {
-        // Construct targetWord in Big-endian order to match x.v[i]
+    // Start from 1 because 0 was checked by Fast filter
+    for(int i = 1; i < fullWords; i++) {
         uint targetWord = ((uint)target[1 + i * 4] << 24) | ((uint)target[2 + i * 4] << 16) | ((uint)target[3 + i * 4] << 8) | (uint)target[4 + i * 4];
         if(x.v[i] != targetWord) return false;
     }
 
-    if(tailBytes != 0) {
+    if(tailBytes != 0 && fullWords < 8) {
         uint mask = tailBytes == 1 ? 0xff000000U : (tailBytes == 2 ? 0xffff0000U : 0xffffff00U);
         uint targetWord = 0;
         int base = 1 + fullWords * 4;
@@ -319,7 +320,10 @@ __kernel void cyclone_check_batch_thread_gpu(
 
     if(result->flag == 2) return;
 
+    // Fast filter pre-calculation
+    uint targetWord0 = ((uint)targetPrefix[1] << 24) | ((uint)targetPrefix[2] << 16) | ((uint)targetPrefix[3] << 8) | (uint)targetPrefix[4];
     uint256_t baseKey = baseKeys[gid];
+
     for(int i = BATCH_SIZE - 1; i >= 1; i--) {
         point_affine_t offsetPoint = batchTable[i - 1];
         uint256_t invDenom;
@@ -333,27 +337,35 @@ __kernel void cyclone_check_batch_thread_gpu(
             invDenom = inverse;
         }
 
-        uint256_t rise = subModP256k(offsetPoint.y, startY);
-        uint256_t slope = mulModP256k(rise, invDenom);
-        uint256_t slopeSq = mulModP256k(slope, slope);
-        uint256_t plusX = subModP256k(subModP256k(slopeSq, startX), offsetPoint.x);
+        uint256_t invDenomSq = squareModP256k(invDenom);
+        
+        // Use Y-coordinates ONLY to differentiate Plus and Minus
+        // But we use a optimized common X-calculation
+        uint256_t rise_P = subModP256k(offsetPoint.y, startY);
+        uint256_t slope_P = mulModP256k(rise_P, invDenom);
+        uint256_t slopeSq_P = mulModP256k(slope_P, slope_P);
+        uint256_t plusX = subModP256k(subModP256k(slopeSq_P, startX), offsetPoint.x);
 
-        if(prefixLen == 1 || xPrefixMatches(plusX, targetPrefix, prefixLen)) {
-            uint256_t plusY = addModP256k(negStartY, mulModP256k(slope, subModP256k(startX, plusX)));
-            if(compressedPrefixMatches(plusX, plusY, targetPrefix, prefixLen)) {
-                storeMatchResult(addSmall256(baseKey, (unsigned int)i), plusX, plusY, targetPrefix, result);
+        if(prefixLen == 1 || xPrefixMatchesFast(plusX, targetWord0)) {
+            if(prefixLen < 5 || xPrefixMatchesFull(plusX, targetPrefix, prefixLen)) {
+                uint256_t plusY = addModP256k(negStartY, mulModP256k(slope_P, subModP256k(startX, plusX)));
+                if(compressedPrefixMatches(plusX, plusY, targetPrefix, prefixLen)) {
+                    storeMatchResult(addSmall256(baseKey, (unsigned int)i), plusX, plusY, targetPrefix, result);
+                }
             }
         }
 
-        rise = negModP256k(addModP256k(offsetPoint.y, startY));
-        slope = mulModP256k(rise, invDenom);
-        slopeSq = mulModP256k(slope, slope);
-        uint256_t minusX = subModP256k(subModP256k(slopeSq, startX), offsetPoint.x);
+        uint256_t rise_M = negModP256k(addModP256k(offsetPoint.y, startY));
+        uint256_t slope_M = mulModP256k(rise_M, invDenom);
+        uint256_t slopeSq_M = mulModP256k(slope_M, slope_M);
+        uint256_t minusX = subModP256k(subModP256k(slopeSq_M, startX), offsetPoint.x);
 
-        if(prefixLen == 1 || xPrefixMatches(minusX, targetPrefix, prefixLen)) {
-            uint256_t minusY = addModP256k(negStartY, mulModP256k(slope, subModP256k(startX, minusX)));
-            if(compressedPrefixMatches(minusX, minusY, targetPrefix, prefixLen)) {
-                storeMatchResult(subSmall256(baseKey, (unsigned int)i), minusX, minusY, targetPrefix, result);
+        if(prefixLen == 1 || xPrefixMatchesFast(minusX, targetWord0)) {
+            if(prefixLen < 5 || xPrefixMatchesFull(minusX, targetPrefix, prefixLen)) {
+                uint256_t minusY = addModP256k(negStartY, mulModP256k(slope_M, subModP256k(startX, minusX)));
+                if(compressedPrefixMatches(minusX, minusY, targetPrefix, prefixLen)) {
+                    storeMatchResult(subSmall256(baseKey, (unsigned int)i), minusX, minusY, targetPrefix, result);
+                }
             }
         }
     }
