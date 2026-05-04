@@ -132,7 +132,7 @@ For real search, start with `-w 65536`:
 .\cyclone_gpu.exe -k 02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16 -p 135 -b 6 -w 65536
 ```
 
-On an RX 6600 XT, `-w 65536` has reached about `1029 Mkeys/s` in real runs. Good values to compare:
+On an RX 6600 XT, `-w 65536` has reached about `1750 Mkeys/s` in real runs. Good values to compare:
 
 ```text
 -w 65536
@@ -181,7 +181,7 @@ Range         : 400000000:7FFFFFFFF
 Batches/loop  : 65536
 Checked/loop  : 33554432
 Search started.
-Time          : 00:03 | Speed: 1667.73 Mkeys/s | Total: 43285217280
+Time          : 00:03 | Speed: 1750.46 Mkeys/s | Total: 43285217280
 ================== PARTIAL MATCH FOUND! ============
 Prefix bytes  : 4
 Private Key   : 00000000000000000000000000000000000000000000000000000004ddb7e1bc

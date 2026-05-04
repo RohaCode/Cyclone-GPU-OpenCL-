@@ -85,14 +85,10 @@ static inline bool computePublicKeyProjectiveCyclone(uint256_t privKey, __global
 
     for(i = 0; i < 32; i++) {
         b = getKeyByte(privKey, i);
-        if(b != 0) {
-            break;
-        }
+        if(b != 0) break;
     }
 
-    if(i >= 32) {
-        return false;
-    }
+    if(i >= 32) return false;
 
     point_projective_t q;
     q.x = gTable[i * 256 + (int)b - 1].x;
@@ -110,79 +106,6 @@ static inline bool computePublicKeyProjectiveCyclone(uint256_t privKey, __global
     return true;
 }
 
-static inline bool computePublicKeyCyclone(uint256_t privKey, __global const point_affine_t* gTable, uint256_t* outX, uint256_t* outY)
-{
-    point_projective_t q;
-    if(!computePublicKeyProjectiveCyclone(privKey, gTable, &q)) {
-        return false;
-    }
-
-    uint256_t invZ = invModP256k(q.z);
-    *outX = mulModP256k(q.x, invZ);
-    *outY = mulModP256k(q.y, invZ);
-    return true;
-}
-
-static inline bool compressedPrefixMatches(uint256_t x, uint256_t y, __constant const uchar* target, int prefixLen)
-{
-    uchar parity = (y.v[7] & 1) ? (uchar)0x03 : (uchar)0x02;
-    if(parity != target[0]) {
-        return false;
-    }
-
-    if(prefixLen > 1) {
-        // Check first 4 bytes of X (excluding parity)
-        unsigned int targetX0 = ((unsigned int)target[1] << 24) | ((unsigned int)target[2] << 16) | ((unsigned int)target[3] << 8) | (unsigned int)target[4];
-        if(x.v[0] != targetX0) return false;
-        
-        for(int i = 4; i < prefixLen - 1; i++) {
-            uchar xb = (uchar)((x.v[i / 4] >> ((3 - (i & 3)) * 8)) & 0xff);
-            if(xb != target[i + 1]) {
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
-
-static inline bool xPrefixMatches(uint256_t x, __constant const uchar* target, int prefixLen)
-{
-    int xBytes = prefixLen - 1;
-    int fullWords = xBytes / 4;
-    int tailBytes = xBytes & 3;
-
-    for(int i = 0; i < fullWords; i++) {
-        uint targetWord =
-            ((uint)target[1 + i * 4] << 24) |
-            ((uint)target[2 + i * 4] << 16) |
-            ((uint)target[3 + i * 4] << 8) |
-            ((uint)target[4 + i * 4]);
-        if(x.v[i] != targetWord) {
-            return false;
-        }
-    }
-
-    if(tailBytes != 0) {
-        uint mask = tailBytes == 1 ? 0xff000000U : (tailBytes == 2 ? 0xffff0000U : 0xffffff00U);
-        uint targetWord = 0;
-        int base = 1 + fullWords * 4;
-        if(tailBytes >= 1) targetWord |= (uint)target[base] << 24;
-        if(tailBytes >= 2) targetWord |= (uint)target[base + 1] << 16;
-        if(tailBytes >= 3) targetWord |= (uint)target[base + 2] << 8;
-        if((x.v[fullWords] & mask) != targetWord) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static inline bool compressedFullMatches(uint256_t x, uint256_t y, __constant const uchar* target)
-{
-    return compressedPrefixMatches(x, y, target, 33);
-}
-
 static inline uint256_t one256()
 {
     return (uint256_t){{0, 0, 0, 0, 0, 0, 0, 1}};
@@ -195,10 +118,86 @@ static inline uint256_t zero256()
 
 static inline uint256_t negModP256k(uint256_t a)
 {
-    if(equal256k(a, zero256())) {
-        return a;
-    }
+    if(equal256k(a, zero256())) return a;
     return subModP256k(zero256(), a);
+}
+
+static inline bool toAffineCyclone(point_projective_t* q, point_affine_t* aff) {
+    if(equal256k(q->z, zero256())) return false;
+    uint256_t invZ = invModP256k(q->z);
+    aff->x = mulModP256k(q->x, invZ);
+    aff->y = mulModP256k(q->y, invZ);
+    return true;
+}
+
+static inline uint256_t add256Raw(uint256_t a, uint256_t b)
+{
+    unsigned int carry = 0;
+    for(int i = 7; i >= 0; i--) {
+        a.v[i] = addc(a.v[i], b.v[i], &carry);
+    }
+    return a;
+}
+
+static inline uint256_t randomMasked256(__global xoshiro_state_t* state, uint256_t mask)
+{
+    uint256_t value;
+    for(int i = 0; i < 4; i++) {
+        ulong r = xoshiro_next(state);
+        value.v[i * 2] = (unsigned int)(r >> 32);
+        value.v[i * 2 + 1] = (unsigned int)r;
+    }
+    for(int i = 0; i < 8; i++) value.v[i] &= mask.v[i];
+    return value;
+}
+
+static inline bool compressedPrefixMatches(uint256_t x, uint256_t y, __constant const uchar* target, int prefixLen)
+{
+    uchar parity = (y.v[7] & 1) ? (uchar)0x03 : (uchar)0x02;
+    if(parity != target[0]) return false;
+
+    if(prefixLen > 1) {
+        unsigned int targetX0 = ((unsigned int)target[1] << 24) | ((unsigned int)target[2] << 16) | ((unsigned int)target[3] << 8) | (unsigned int)target[4];
+        if(x.v[0] != targetX0) return false;
+        for(int i = 4; i < prefixLen - 1; i++) {
+            uchar xb = (uchar)((x.v[i / 4] >> ((3 - (i & 3)) * 8)) & 0xff);
+            if(xb != target[i + 1]) return false;
+        }
+    }
+    return true;
+}
+
+static inline bool xPrefixMatches(uint256_t x, __constant const uchar* target, int prefixLen)
+{
+    int xBytes = prefixLen - 1;
+    int fullWords = xBytes / 4;
+    int tailBytes = xBytes & 3;
+
+    for(int i = 0; i < fullWords; i++) {
+        uint targetWord = ((uint)target[1 + i * 4] << 24) | ((uint)target[2 + i * 4] << 16) | ((uint)target[3 + i * 4] << 8) | (uint)target[4 + i * 4];
+        if(x.v[i] != targetWord) return false;
+    }
+
+    if(tailBytes != 0) {
+        uint mask = tailBytes == 1 ? 0xff000000U : (tailBytes == 2 ? 0xffff0000U : 0xffffff00U);
+        uint targetWord = 0;
+        int base = 1 + fullWords * 4;
+        if(tailBytes >= 1) targetWord |= (uint)target[base] << 24;
+        if(tailBytes >= 2) targetWord |= (uint)target[base + 1] << 16;
+        if(tailBytes >= 3) targetWord |= (uint)target[base + 2] << 8;
+        if((x.v[fullWords] & mask) != targetWord) return false;
+    }
+    return true;
+}
+
+static inline void storeMatchResult(uint256_t privKey, uint256_t x, uint256_t y, __constant const uchar* targetPrefix, __global cyclone_result_t* result)
+{
+    // Simplified: always store if flag is 0 or 1
+    if(atomic_cmpxchg((volatile __global unsigned int*)&result->flag, 0u, 2u) == 0u || result->flag == 1u) {
+        result->privKey = privKey;
+        result->x = x;
+        result->y = y;
+    }
 }
 
 static inline uint256_t addSmall256(uint256_t a, unsigned int value)
@@ -223,135 +222,33 @@ static inline uint256_t subSmall256(uint256_t a, unsigned int value)
     return a;
 }
 
-static inline uint256_t add256Raw(uint256_t a, uint256_t b)
-{
-    unsigned int carry = 0;
-    for(int i = 7; i >= 0; i--) {
-        a.v[i] = addc(a.v[i], b.v[i], &carry);
-    }
-    return a;
-}
-
-static inline uint256_t randomMasked256(__global xoshiro_state_t* state, uint256_t mask)
-{
-    uint256_t value;
-    for(int i = 0; i < 4; i++) {
-        ulong r = xoshiro_next(state);
-        value.v[i * 2] = (unsigned int)(r >> 32);
-        value.v[i * 2 + 1] = (unsigned int)r;
-    }
-
-    for(int i = 0; i < 8; i++) {
-        value.v[i] &= mask.v[i];
-    }
-    return value;
-}
-
-static inline uint256_t mulModP256k_fast(uint256_t a, uint256_t b)
-{
-    return mulModP256k(a, b);
-}
-
-static inline uint256_t squareModP256k_fast(uint256_t a)
-{
-    return mulModP256k_fast(a, a);
-}
-
-static inline void storePartialResult(uint256_t privKey, uint256_t x, uint256_t y, __global cyclone_result_t* result)
-{
-    if(atomic_cmpxchg((volatile __global unsigned int*)&result->flag, 0u, 1u) == 0u) {
-        result->privKey = privKey;
-        result->x = x;
-        result->y = y;
-    }
-}
-
-static inline void storeFullResult(uint256_t privKey, uint256_t x, uint256_t y, __global cyclone_result_t* result)
-{
-    atomic_xchg((volatile __global unsigned int*)&result->flag, 2u);
-    result->privKey = privKey;
-    result->x = x;
-    result->y = y;
-}
-
-static inline void storeMatchResult(uint256_t privKey, uint256_t x, uint256_t y, __constant const uchar* targetPrefix, __global cyclone_result_t* result)
-{
-    if(compressedFullMatches(x, y, targetPrefix)) {
-        storeFullResult(privKey, x, y, result);
-    } else {
-        storePartialResult(privKey, x, y, result);
-    }
-}
-
-__kernel void cyclone_generate_base_keys_gpu(
-    __global xoshiro_state_t* rngStates,
-    __global uint256_t* baseKeys,
-    const uint256_t minKey,
-    const uint256_t rangeMask)
-{
-    int gid = get_global_id(0);
-    uint256_t offset = randomMasked256(&rngStates[gid], rangeMask);
-    baseKeys[gid] = add256Raw(minKey, offset);
-}
-
 __kernel void cyclone_search_gpu(
-    __global const uint256_t* baseKeys,
+    __global xoshiro_state_t* rngStates,
     __global const point_affine_t* gTable,
     __constant const uchar* targetPrefix,
     const int prefixLen,
     __global point_affine_t* startPoints,
-    __global cyclone_result_t* result)
+    __global cyclone_result_t* result,
+    __global uint256_t* baseKeys,
+    const uint256_t minKey,
+    const uint256_t rangeMask)
 {
     const int gid = get_global_id(0);
-    const int lid = get_local_id(0);
-    uint256_t baseKey = baseKeys[gid];
 
-    __local uint256_t zValues[256];
-    __local uint256_t batchFactors[256];
-    __local uint256_t prefixProducts[256];
-    __local uint256_t invZValues[256];
+    uint256_t baseKey = randomMasked256(&rngStates[gid], rangeMask);
+    baseKey = add256Raw(minKey, baseKey);
+    baseKeys[gid] = baseKey;
 
     point_projective_t q;
-    if(!computePublicKeyProjectiveCyclone(baseKey, gTable, &q)) {
-        startPoints[gid].x = zero256();
-        startPoints[gid].y = zero256();
-        zValues[lid] = one256();
-    } else {
-        zValues[lid] = q.z;
-    }
-    batchFactors[lid] = equal256k(zValues[lid], zero256()) ? one256() : zValues[lid];
+    if(!computePublicKeyProjectiveCyclone(baseKey, gTable, &q)) return;
 
-    barrier(CLK_LOCAL_MEM_FENCE);
+    point_affine_t aff;
+    if(!toAffineCyclone(&q, &aff)) return;
 
-    if(lid == 0) {
-        uint256_t acc = one256();
-        int localSize = get_local_size(0);
-        for(int i = 0; i < localSize; i++) {
-            prefixProducts[i] = acc;
-            acc = mulModP256k(acc, batchFactors[i]);
-        }
+    startPoints[gid] = aff;
 
-        uint256_t invAcc = invModP256k(acc);
-        for(int i = localSize - 1; i >= 0; i--) {
-            invZValues[i] = mulModP256k(invAcc, prefixProducts[i]);
-            invAcc = mulModP256k(invAcc, batchFactors[i]);
-        }
-    }
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    if(equal256k(zValues[lid], zero256())) {
-        return;
-    }
-
-    uint256_t invZ = invZValues[lid];
-    uint256_t x = mulModP256k(q.x, invZ);
-    uint256_t y = mulModP256k(q.y, invZ);
-    startPoints[gid].x = x;
-    startPoints[gid].y = y;
-
-    if(compressedPrefixMatches(x, y, targetPrefix, prefixLen)) {
-        storeMatchResult(baseKey, x, y, targetPrefix, result);
+    if(compressedPrefixMatches(aff.x, aff.y, targetPrefix, prefixLen)) {
+        storeMatchResult(baseKey, aff.x, aff.y, targetPrefix, result);
     }
 }
 
@@ -359,7 +256,7 @@ __kernel void cyclone_search_gpu(
 
 __kernel void cyclone_check_batch_thread_gpu(
     __global const uint256_t* baseKeys,
-    __constant const point_affine_t* gTable,
+    __global const point_affine_t* batchTable,
     __constant const uchar* targetPrefix,
     const int prefixLen,
     __global const point_affine_t* startPoints,
@@ -367,36 +264,49 @@ __kernel void cyclone_check_batch_thread_gpu(
     __global uint256_t* chain)
 {
     const int gid = get_global_id(0);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
     const int dim = get_global_size(0);
 
-    uint256_t baseKey = baseKeys[gid];
+    __local uint256_t loc_factors[256];
+    __local uint256_t loc_prefixes[256];
+    __local uint256_t loc_inverted[256];
+
     uint256_t startX = startPoints[gid].x;
     uint256_t startY = startPoints[gid].y;
     uint256_t negStartY = negModP256k(startY);
 
     uint256_t inverse = one256();
-
-    // Pass 1: Forward pass to build the chain
-    #pragma unroll 2
     for(int i = 1; i < BATCH_SIZE; i++) {
-        point_affine_t offsetPoint = gTable[i - 1];
+        point_affine_t offsetPoint = batchTable[i - 1];
         uint256_t denom = subModP256k(offsetPoint.x, startX);
         uint256_t factor = equal256k(denom, zero256()) ? one256() : denom;
         inverse = mulModP256k(inverse, factor);
         chain[(i - 1) * dim + gid] = inverse;
     }
 
-    // Pass 2: Individual Inversion
-    inverse = invModP256k(inverse);
-
-    if(result->flag == 2) {
-        return;
+    loc_factors[lid] = inverse;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if(lid == 0) {
+        uint256_t acc = one256();
+        for(int i = 0; i < lsize; i++) {
+            loc_prefixes[i] = acc;
+            acc = mulModP256k(acc, loc_factors[i]);
+        }
+        uint256_t invAcc = invModP256k(acc);
+        for(int i = lsize - 1; i >= 0; i--) {
+            loc_inverted[i] = mulModP256k(invAcc, loc_prefixes[i]);
+            invAcc = mulModP256k(invAcc, loc_factors[i]);
+        }
     }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    inverse = loc_inverted[lid];
 
-    // Pass 3: Backward pass to find the points
-    #pragma unroll 2
+    if(result->flag == 2) return;
+
+    uint256_t baseKey = baseKeys[gid];
     for(int i = BATCH_SIZE - 1; i >= 1; i--) {
-        point_affine_t offsetPoint = gTable[i - 1];
+        point_affine_t offsetPoint = batchTable[i - 1];
         uint256_t invDenom;
         uint256_t denom = subModP256k(offsetPoint.x, startX);
         uint256_t factor = equal256k(denom, zero256()) ? one256() : denom;
@@ -431,123 +341,6 @@ __kernel void cyclone_check_batch_thread_gpu(
                 storeMatchResult(subSmall256(baseKey, (unsigned int)i), minusX, minusY, targetPrefix, result);
             }
         }
-    }
-}
-
-
-__kernel void cyclone_debug_scalar_gpu(
-    __global const uint256_t* keys,
-    __global const point_affine_t* gTable,
-    __global point_affine_t* outPoints)
-{
-    int gid = get_global_id(0);
-    uint256_t x;
-    uint256_t y;
-    if(computePublicKeyCyclone(keys[gid], gTable, &x, &y)) {
-        outPoints[gid].x = x;
-        outPoints[gid].y = y;
-    } else {
-        outPoints[gid].x = zero256();
-        outPoints[gid].y = zero256();
-    }
-}
-
-__kernel void cyclone_debug_batch_gpu(
-    __global const uint256_t* baseKeys,
-    __global const point_affine_t* gTable,
-    __global const point_affine_t* startPoints,
-    __global point_affine_t* outPoints)
-{
-    const int lid = get_local_id(0);
-    uint256_t baseKey = baseKeys[0];
-    (void)baseKey;
-
-    __local uint256_t denoms[256];
-    __local uint256_t batchFactors[256];
-    __local uint256_t prefixProducts[256];
-    __local uint256_t suffixProducts[256];
-    __local uint256_t invDenoms[256];
-    __local uint256_t totalInverse;
-
-    uint256_t startX = startPoints[0].x;
-    uint256_t startY = startPoints[0].y;
-
-    point_affine_t offsetPoint;
-    if(lid == 0) {
-        denoms[lid] = one256();
-        offsetPoint.x = zero256();
-        offsetPoint.y = zero256();
-    } else {
-        offsetPoint = gTable[lid - 1];
-        denoms[lid] = subModP256k(offsetPoint.x, startX);
-    }
-    batchFactors[lid] = equal256k(denoms[lid], zero256()) ? one256() : denoms[lid];
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    prefixProducts[lid] = batchFactors[lid];
-    suffixProducts[lid] = batchFactors[lid];
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    for(int offset = 1; offset < 256; offset <<= 1) {
-        uint256_t prefixValue = prefixProducts[lid];
-        uint256_t suffixValue = suffixProducts[lid];
-        if(lid >= offset) {
-            prefixValue = mulModP256k(prefixProducts[lid - offset], prefixValue);
-        }
-        if(lid + offset < 256) {
-            suffixValue = mulModP256k(suffixValue, suffixProducts[lid + offset]);
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-        prefixProducts[lid] = prefixValue;
-        suffixProducts[lid] = suffixValue;
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    if(lid == 255) {
-        totalInverse = invModP256k(prefixProducts[255]);
-    }
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    if(lid == 0) {
-        invDenoms[lid] = one256();
-    } else {
-        uint256_t withoutSelf = prefixProducts[lid - 1];
-        if(lid < 255) {
-            withoutSelf = mulModP256k(withoutSelf, suffixProducts[lid + 1]);
-        }
-        invDenoms[lid] = mulModP256k(totalInverse, withoutSelf);
-    }
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    if(lid == 0) {
-        outPoints[0].x = startX;
-        outPoints[0].y = startY;
-        return;
-    }
-
-    uint256_t invDenom = invDenoms[lid];
-
-    uint256_t rise = subModP256k(offsetPoint.y, startY);
-    uint256_t slope = mulModP256k(rise, invDenom);
-    uint256_t slopeSq = squareModP256k(slope);
-    uint256_t plusX = subModP256k(subModP256k(slopeSq, startX), offsetPoint.x);
-    uint256_t plusY = addModP256k(negModP256k(startY), mulModP256k(slope, subModP256k(startX, plusX)));
-
-    uint256_t minusPointY = negModP256k(offsetPoint.y);
-    rise = subModP256k(minusPointY, startY);
-    slope = mulModP256k(rise, invDenom);
-    slopeSq = squareModP256k(slope);
-    uint256_t minusX = subModP256k(subModP256k(slopeSq, startX), offsetPoint.x);
-    uint256_t minusY = addModP256k(negModP256k(startY), mulModP256k(slope, subModP256k(startX, minusX)));
-
-    if(lid == 1) {
-        outPoints[1].x = plusX;
-        outPoints[1].y = plusY;
-        outPoints[2].x = minusX;
-        outPoints[2].y = minusY;
     }
 }
 

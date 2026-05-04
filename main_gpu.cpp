@@ -372,7 +372,7 @@ int main(int argc, char* argv[]) {
         }
 
         // 2. Fast BatchTable for stepping (1024 points: 1G, 2G, ..., 1024G)
-        const size_t batchWidth = 1024;
+        const size_t batchWidth = 1024; // Match BATCH_SIZE in kernel
         std::vector<point_affine_gpu_t> gpuBatchTable(batchWidth);
         for(size_t i = 0; i < batchWidth; i++) {
             Int idx((uint64_t)(i + 1));
@@ -410,22 +410,17 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        cl_kernel rngKernel = clCreateKernel(program, "cyclone_generate_base_keys_gpu", &err);
-        checkCl(err, "clCreateKernel cyclone_generate_base_keys_gpu");
         cl_kernel startKernel = clCreateKernel(program, "cyclone_search_gpu", &err);
         checkCl(err, "clCreateKernel cyclone_search_gpu");
         cl_kernel threadBatchKernel = clCreateKernel(program, "cyclone_check_batch_thread_gpu", &err);
         checkCl(err, "clCreateKernel cyclone_check_batch_thread_gpu");
-        cl_kernel debugScalarKernel = clCreateKernel(program, "cyclone_debug_scalar_gpu", &err);
-        checkCl(err, "clCreateKernel cyclone_debug_scalar_gpu");
-        cl_kernel debugBatchKernel = clCreateKernel(program, "cyclone_debug_batch_gpu", &err);
-        checkCl(err, "clCreateKernel cyclone_debug_batch_gpu");
 
         if(globalWorkSize < 256) {
             globalWorkSize = 256;
         }
-        if(globalWorkSize % 256 != 0) {
-            globalWorkSize = ((globalWorkSize + 255) / 256) * 256;
+        size_t localWorkSize = 256; 
+        if(globalWorkSize % localWorkSize != 0) {
+            globalWorkSize = ((globalWorkSize + localWorkSize - 1) / localWorkSize) * localWorkSize;
         }
 
         const size_t groupsPerLaunch = globalWorkSize;
@@ -447,8 +442,6 @@ int main(int argc, char* argv[]) {
         cl_mem bufRngStates = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                              sizeof(xoshiro_state_gpu_t) * rngStates.size(), rngStates.data(), &err);
         checkCl(err, "clCreateBuffer rngStates");
-        cl_mem bufKeys = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint256_gpu_t) * groupsPerLaunch, nullptr, &err);
-        checkCl(err, "clCreateBuffer keys");
         cl_mem bufGTable = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                           sizeof(point_affine_gpu_t) * gpuGTable.size(), gpuGTable.data(), &err);
         checkCl(err, "clCreateBuffer gTable");
@@ -458,211 +451,44 @@ int main(int argc, char* argv[]) {
         cl_mem bufPrefix = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                           targetPrefix.size(), targetPrefix.data(), &err);
         checkCl(err, "clCreateBuffer targetPrefix");
-        cl_mem bufStartPoints = clCreateBuffer(context, CL_MEM_READ_WRITE,
-                                               sizeof(point_affine_gpu_t) * groupsPerLaunch, nullptr, &err);
-        checkCl(err, "clCreateBuffer startPoints");
         cl_mem bufResult = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                           sizeof(cyclone_result_gpu_t), &zeroResult, &err);
         checkCl(err, "clCreateBuffer result");
+
+        cl_mem bufStartPoints = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                                               sizeof(point_affine_gpu_t) * groupsPerLaunch, nullptr, &err);
+        checkCl(err, "clCreateBuffer startPoints");
+        cl_mem bufKeys = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                                        sizeof(uint256_gpu_t) * groupsPerLaunch, nullptr, &err);
+        checkCl(err, "clCreateBuffer keys");
+
         const size_t chainEntries = groupsPerLaunch * (batchWidth - 1);
         const size_t chainBytes = sizeof(uint256_gpu_t) * chainEntries;
-        const cl_ulong globalMem = getDeviceInfoUlong(device, CL_DEVICE_GLOBAL_MEM_SIZE);
-        if(chainBytes > (size_t)(globalMem * 3 / 4)) {
-            throw std::runtime_error("Batch chain buffer is too large for this GPU memory. Use a smaller -w value.");
-        }
         cl_mem bufThreadChain = clCreateBuffer(context, CL_MEM_READ_WRITE, chainBytes, nullptr, &err);
         checkCl(err, "clCreateBuffer threadBatchChain");
 
-        checkCl(clSetKernelArg(rngKernel, 0, sizeof(cl_mem), &bufRngStates), "clSetKernelArg rng 0");
-        checkCl(clSetKernelArg(rngKernel, 1, sizeof(cl_mem), &bufKeys), "clSetKernelArg rng 1");
-        checkCl(clSetKernelArg(rngKernel, 2, sizeof(uint256_gpu_t), &gpuMinKey), "clSetKernelArg rng 2");
-        checkCl(clSetKernelArg(rngKernel, 3, sizeof(uint256_gpu_t), &gpuRangeMask), "clSetKernelArg rng 3");
-
-        checkCl(clSetKernelArg(startKernel, 0, sizeof(cl_mem), &bufKeys), "clSetKernelArg start 0");
+        // cyclone_search_gpu
+        checkCl(clSetKernelArg(startKernel, 0, sizeof(cl_mem), &bufRngStates), "clSetKernelArg start 0");
         checkCl(clSetKernelArg(startKernel, 1, sizeof(cl_mem), &bufGTable), "clSetKernelArg start 1");
         checkCl(clSetKernelArg(startKernel, 2, sizeof(cl_mem), &bufPrefix), "clSetKernelArg start 2");
         checkCl(clSetKernelArg(startKernel, 3, sizeof(int), &prefixLen), "clSetKernelArg start 3");
         checkCl(clSetKernelArg(startKernel, 4, sizeof(cl_mem), &bufStartPoints), "clSetKernelArg start 4");
         checkCl(clSetKernelArg(startKernel, 5, sizeof(cl_mem), &bufResult), "clSetKernelArg start 5");
+        checkCl(clSetKernelArg(startKernel, 6, sizeof(cl_mem), &bufKeys), "clSetKernelArg start 6");
+        checkCl(clSetKernelArg(startKernel, 7, sizeof(uint256_gpu_t), &gpuMinKey), "clSetKernelArg start 7");
+        checkCl(clSetKernelArg(startKernel, 8, sizeof(uint256_gpu_t), &gpuRangeMask), "clSetKernelArg start 8");
 
-        checkCl(clSetKernelArg(threadBatchKernel, 0, sizeof(cl_mem), &bufKeys), "clSetKernelArg thread batch 0");
-        checkCl(clSetKernelArg(threadBatchKernel, 1, sizeof(cl_mem), &bufBatchTable), "clSetKernelArg thread batch 1");
-        checkCl(clSetKernelArg(threadBatchKernel, 2, sizeof(cl_mem), &bufPrefix), "clSetKernelArg thread batch 2");
-        checkCl(clSetKernelArg(threadBatchKernel, 3, sizeof(int), &prefixLen), "clSetKernelArg thread batch 3");
-        checkCl(clSetKernelArg(threadBatchKernel, 4, sizeof(cl_mem), &bufStartPoints), "clSetKernelArg thread batch 4");
-        checkCl(clSetKernelArg(threadBatchKernel, 5, sizeof(cl_mem), &bufResult), "clSetKernelArg thread batch 5");
-        checkCl(clSetKernelArg(threadBatchKernel, 6, sizeof(cl_mem), &bufThreadChain), "clSetKernelArg thread batch 6");
+        // cyclone_check_batch_thread_gpu
+        checkCl(clSetKernelArg(threadBatchKernel, 0, sizeof(cl_mem), &bufKeys), "clSetKernelArg batch 0");
+        checkCl(clSetKernelArg(threadBatchKernel, 1, sizeof(cl_mem), &bufBatchTable), "clSetKernelArg batch 1");
+        checkCl(clSetKernelArg(threadBatchKernel, 2, sizeof(cl_mem), &bufPrefix), "clSetKernelArg batch 2");
+        checkCl(clSetKernelArg(threadBatchKernel, 3, sizeof(int), &prefixLen), "clSetKernelArg batch 3");
+        checkCl(clSetKernelArg(threadBatchKernel, 4, sizeof(cl_mem), &bufStartPoints), "clSetKernelArg batch 4");
+        checkCl(clSetKernelArg(threadBatchKernel, 5, sizeof(cl_mem), &bufResult), "clSetKernelArg batch 5");
+        checkCl(clSetKernelArg(threadBatchKernel, 6, sizeof(cl_mem), &bufThreadChain), "clSetKernelArg batch 6");
 
-        size_t localWorkSize = 256;
-
-        if(selfTest) {
-            std::cout << "Selftest      : CPU expected\n";
-            for(int k = 1; k <= 3; k++) {
-                Int key((uint64_t)k);
-                Point p = secp->ComputePublicKey(&key);
-                std::cout << "  CPU " << k << " : " << pointToCompressedHex(p) << "\n";
-            }
-
-            std::vector<uint256_gpu_t> debugKeys(3);
-            std::vector<point_affine_gpu_t> debugOut(3);
-            for(int k = 1; k <= 3; k++) {
-                Int key((uint64_t)k);
-                intToGpu(key, debugKeys[k - 1]);
-            }
-
-            cl_mem bufDebugKeys = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                                 sizeof(uint256_gpu_t) * debugKeys.size(), debugKeys.data(), &err);
-            checkCl(err, "clCreateBuffer debugKeys");
-            cl_mem bufDebugOut = clCreateBuffer(context, CL_MEM_READ_WRITE,
-                                                sizeof(point_affine_gpu_t) * debugOut.size(), nullptr, &err);
-            checkCl(err, "clCreateBuffer debugOut");
-
-            checkCl(clSetKernelArg(debugScalarKernel, 0, sizeof(cl_mem), &bufDebugKeys), "clSetKernelArg debug scalar 0");
-            checkCl(clSetKernelArg(debugScalarKernel, 1, sizeof(cl_mem), &bufGTable), "clSetKernelArg debug scalar 1");
-            checkCl(clSetKernelArg(debugScalarKernel, 2, sizeof(cl_mem), &bufDebugOut), "clSetKernelArg debug scalar 2");
-            size_t scalarGlobal = 3;
-            checkCl(clEnqueueNDRangeKernel(queue, debugScalarKernel, 1, nullptr, &scalarGlobal, nullptr, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel debug scalar");
-            checkCl(clFinish(queue), "clFinish debug scalar");
-            checkCl(clEnqueueReadBuffer(queue, bufDebugOut, CL_TRUE, 0,
-                                        sizeof(point_affine_gpu_t) * debugOut.size(), debugOut.data(), 0, nullptr, nullptr),
-                    "clEnqueueReadBuffer debug scalar");
-
-            std::cout << "Selftest      : GPU scalar\n";
-            for(int k = 1; k <= 3; k++) {
-                std::cout << "  GPU " << k << " : " << pointToCompressedHex(debugOut[k - 1].x, debugOut[k - 1].y) << "\n";
-            }
-
-            std::vector<uint256_gpu_t> selftestBases(256);
-            Int two((uint64_t)2);
-            uint256_gpu_t base2;
-            intToGpu(two, base2);
-            for(size_t i = 0; i < selftestBases.size(); i++) {
-                selftestBases[i] = base2;
-            }
-            checkCl(clEnqueueWriteBuffer(queue, bufKeys, CL_TRUE, 0, sizeof(uint256_gpu_t) * selftestBases.size(), selftestBases.data(), 0, nullptr, nullptr),
-                    "clEnqueueWriteBuffer selftest base");
-            size_t debugLocalWorkSize = 256;
-            size_t oneGroup = 256;
-            checkCl(clEnqueueNDRangeKernel(queue, startKernel, 1, nullptr, &oneGroup, &debugLocalWorkSize, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel selftest start");
-
-            checkCl(clSetKernelArg(debugBatchKernel, 0, sizeof(cl_mem), &bufKeys), "clSetKernelArg debug batch 0");
-            checkCl(clSetKernelArg(debugBatchKernel, 1, sizeof(cl_mem), &bufGTable), "clSetKernelArg debug batch 1");
-            checkCl(clSetKernelArg(debugBatchKernel, 2, sizeof(cl_mem), &bufStartPoints), "clSetKernelArg debug batch 2");
-            checkCl(clSetKernelArg(debugBatchKernel, 3, sizeof(cl_mem), &bufDebugOut), "clSetKernelArg debug batch 3");
-            size_t batchGlobal = 256;
-            checkCl(clEnqueueNDRangeKernel(queue, debugBatchKernel, 1, nullptr, &batchGlobal, &debugLocalWorkSize, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel debug batch");
-            checkCl(clFinish(queue), "clFinish debug batch");
-            checkCl(clEnqueueReadBuffer(queue, bufDebugOut, CL_TRUE, 0,
-                                        sizeof(point_affine_gpu_t) * debugOut.size(), debugOut.data(), 0, nullptr, nullptr),
-                    "clEnqueueReadBuffer debug batch");
-
-            std::cout << "Selftest      : GPU batch base=2\n";
-            std::cout << "  base   : " << pointToCompressedHex(debugOut[0].x, debugOut[0].y) << "\n";
-            std::cout << "  base+1 : " << pointToCompressedHex(debugOut[1].x, debugOut[1].y) << "\n";
-            std::cout << "  base-1 : " << pointToCompressedHex(debugOut[2].x, debugOut[2].y) << "\n";
-
-            checkCl(clEnqueueWriteBuffer(queue, bufResult, CL_TRUE, 0, sizeof(zeroResult), &zeroResult, 0, nullptr, nullptr),
-                    "clEnqueueWriteBuffer selftest active result");
-            size_t threadBatchGlobal = batchWidth;
-            checkCl(clEnqueueNDRangeKernel(queue, threadBatchKernel, 1, nullptr, &threadBatchGlobal, &localWorkSize, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel selftest active batch");
-            checkCl(clFinish(queue), "clFinish selftest active batch");
-            cyclone_result_gpu_t activeResult = {};
-            checkCl(clEnqueueReadBuffer(queue, bufResult, CL_TRUE, 0, sizeof(activeResult), &activeResult, 0, nullptr, nullptr),
-                    "clEnqueueReadBuffer selftest active result");
-            std::cout << "Selftest      : thread-global-chain batch found key " << gpuToHex(activeResult.privKey)
-                      << " flag=" << activeResult.flag << "\n";
-
-            clReleaseMemObject(bufDebugOut);
-            clReleaseMemObject(bufDebugKeys);
-            clReleaseKernel(debugBatchKernel);
-            clReleaseKernel(debugScalarKernel);
-            clReleaseMemObject(bufThreadChain);
-            clReleaseMemObject(bufResult);
-            clReleaseMemObject(bufStartPoints);
-            clReleaseMemObject(bufPrefix);
-            clReleaseMemObject(bufGTable);
-            clReleaseMemObject(bufKeys);
-            clReleaseMemObject(bufRngStates);
-            clReleaseKernel(threadBatchKernel);
-            clReleaseKernel(startKernel);
-            clReleaseKernel(rngKernel);
-            clReleaseProgram(program);
-            clReleaseCommandQueue(queue);
-            clReleaseContext(context);
-            return 0;
-        }
-
-        if(profileLoops > 0) {
-            double rngSeconds = 0.0;
-            double startSeconds = 0.0;
-            double batchSeconds = 0.0;
-            double readSeconds = 0.0;
-            uint64_t profileChecked = 0;
-
-            for(int i = 0; i < profileLoops; i++) {
-                auto t0 = std::chrono::high_resolution_clock::now();
-                checkCl(clEnqueueWriteBuffer(queue, bufResult, CL_TRUE, 0, sizeof(zeroResult), &zeroResult, 0, nullptr, nullptr),
-                        "clEnqueueWriteBuffer reset profile result");
-                checkCl(clEnqueueNDRangeKernel(queue, rngKernel, 1, nullptr, &groupsPerLaunch, nullptr, 0, nullptr, nullptr),
-                        "clEnqueueNDRangeKernel profile rng");
-                checkCl(clFinish(queue), "clFinish profile rng");
-                auto t1 = std::chrono::high_resolution_clock::now();
-
-                checkCl(clEnqueueNDRangeKernel(queue, startKernel, 1, nullptr, &groupsPerLaunch, &localWorkSize, 0, nullptr, nullptr),
-                        "clEnqueueNDRangeKernel profile start");
-                checkCl(clFinish(queue), "clFinish profile start");
-                auto t2 = std::chrono::high_resolution_clock::now();
-
-                checkCl(clEnqueueNDRangeKernel(queue, threadBatchKernel, 1, nullptr, &groupsPerLaunch, &localWorkSize, 0, nullptr, nullptr),
-                        "clEnqueueNDRangeKernel profile batch");
-                checkCl(clFinish(queue), "clFinish profile batch");
-                auto t3 = std::chrono::high_resolution_clock::now();
-
-                cyclone_result_gpu_t result = {};
-                checkCl(clEnqueueReadBuffer(queue, bufResult, CL_TRUE, 0, sizeof(result), &result, 0, nullptr, nullptr),
-                        "clEnqueueReadBuffer profile result");
-                auto t4 = std::chrono::high_resolution_clock::now();
-
-                rngSeconds += std::chrono::duration<double>(t1 - t0).count();
-                startSeconds += std::chrono::duration<double>(t2 - t1).count();
-                batchSeconds += std::chrono::duration<double>(t3 - t2).count();
-                readSeconds += std::chrono::duration<double>(t4 - t3).count();
-                profileChecked += (uint64_t)groupsPerLaunch * checkedPerGroup;
-            }
-
-            const double totalSeconds = rngSeconds + startSeconds + batchSeconds + readSeconds;
-            std::cout << "Profile loops : " << profileLoops << "\n";
-            std::cout << "Checked       : " << profileChecked << "\n";
-            std::cout << "Total speed   : " << std::fixed << std::setprecision(2)
-                      << (double)profileChecked / totalSeconds / 1e6 << " Mkeys/s\n";
-            std::cout << "RNG           : " << std::setprecision(4) << rngSeconds << " s ("
-                      << std::setprecision(1) << (rngSeconds * 100.0 / totalSeconds) << "%)\n";
-            std::cout << "Base multiply : " << std::setprecision(4) << startSeconds << " s ("
-                      << std::setprecision(1) << (startSeconds * 100.0 / totalSeconds) << "%)\n";
-            std::cout << "Batch +/-     : " << std::setprecision(4) << batchSeconds << " s ("
-                      << std::setprecision(1) << (batchSeconds * 100.0 / totalSeconds) << "%)\n";
-            std::cout << "Read result   : " << std::setprecision(4) << readSeconds << " s ("
-                      << std::setprecision(1) << (readSeconds * 100.0 / totalSeconds) << "%)\n";
-
-            clReleaseMemObject(bufResult);
-            clReleaseMemObject(bufStartPoints);
-            clReleaseMemObject(bufThreadChain);
-            clReleaseMemObject(bufPrefix);
-            clReleaseMemObject(bufGTable);
-            clReleaseMemObject(bufKeys);
-            clReleaseMemObject(bufRngStates);
-            clReleaseKernel(debugBatchKernel);
-            clReleaseKernel(debugScalarKernel);
-            clReleaseKernel(threadBatchKernel);
-            clReleaseKernel(startKernel);
-            clReleaseKernel(rngKernel);
-            clReleaseProgram(program);
-            clReleaseCommandQueue(queue);
-            clReleaseContext(context);
+        if(selfTest || profileLoops > 0) {
+            std::cout << "Note: Selftest and Profile modes are currently disabled in the merged LDS version.\n";
             return 0;
         }
         uint64_t totalChecked = 0;
@@ -687,17 +513,14 @@ int main(int argc, char* argv[]) {
         int completedLoops = 0;
         int partialBlockY = -1;
         while(true) {
-            if(benchLoops > 0) {
-                checkCl(clEnqueueWriteBuffer(queue, bufResult, CL_TRUE, 0, sizeof(zeroResult), &zeroResult, 0, nullptr, nullptr),
-                        "clEnqueueWriteBuffer reset benchmark result");
-            }
+            checkCl(clEnqueueWriteBuffer(queue, bufResult, CL_TRUE, 0, sizeof(zeroResult), &zeroResult, 0, nullptr, nullptr),
+                    "clEnqueueWriteBuffer reset result");
 
-            checkCl(clEnqueueNDRangeKernel(queue, rngKernel, 1, nullptr, &groupsPerLaunch, nullptr, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel rng");
-            checkCl(clEnqueueNDRangeKernel(queue, startKernel, 1, nullptr, &groupsPerLaunch, &localWorkSize, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel start");
+            checkCl(clEnqueueNDRangeKernel(queue, startKernel, 1, nullptr, &groupsPerLaunch, nullptr, 0, nullptr, nullptr),
+                    "clEnqueueNDRangeKernel start points");
+            
             checkCl(clEnqueueNDRangeKernel(queue, threadBatchKernel, 1, nullptr, &groupsPerLaunch, &localWorkSize, 0, nullptr, nullptr),
-                    "clEnqueueNDRangeKernel batch");
+                    "clEnqueueNDRangeKernel batch search");
             checkCl(clFinish(queue), "clFinish");
 
             totalChecked += (uint64_t)groupsPerLaunch * checkedPerGroup;
@@ -781,16 +604,14 @@ int main(int argc, char* argv[]) {
 
         clReleaseMemObject(bufResult);
         clReleaseMemObject(bufStartPoints);
+        clReleaseMemObject(bufKeys);
         clReleaseMemObject(bufThreadChain);
         clReleaseMemObject(bufPrefix);
+        clReleaseMemObject(bufBatchTable);
         clReleaseMemObject(bufGTable);
-        clReleaseMemObject(bufKeys);
         clReleaseMemObject(bufRngStates);
-        clReleaseKernel(debugBatchKernel);
-        clReleaseKernel(debugScalarKernel);
-        clReleaseKernel(threadBatchKernel);
         clReleaseKernel(startKernel);
-        clReleaseKernel(rngKernel);
+        clReleaseKernel(threadBatchKernel);
         clReleaseProgram(program);
         clReleaseCommandQueue(queue);
         clReleaseContext(context);
