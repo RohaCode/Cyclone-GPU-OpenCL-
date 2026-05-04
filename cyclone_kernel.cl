@@ -153,16 +153,16 @@ static inline uint256_t randomMasked256(__global xoshiro_state_t* state, uint256
 
 static inline bool compressedPrefixMatches(uint256_t x, uint256_t y, __constant const uchar* target, int prefixLen)
 {
+    // 1. Check parity byte (target[0])
     uchar parity = (y.v[7] & 1) ? (uchar)0x03 : (uchar)0x02;
     if(parity != target[0]) return false;
 
-    if(prefixLen > 1) {
-        unsigned int targetX0 = ((unsigned int)target[1] << 24) | ((unsigned int)target[2] << 16) | ((unsigned int)target[3] << 8) | (unsigned int)target[4];
-        if(x.v[0] != targetX0) return false;
-        for(int i = 4; i < prefixLen - 1; i++) {
-            uchar xb = (uchar)((x.v[i / 4] >> ((3 - (i & 3)) * 8)) & 0xff);
-            if(xb != target[i + 1]) return false;
-        }
+    // 2. Check X bytes if prefixLen > 1
+    for(int i = 0; i < prefixLen - 1; i++) {
+        int wordIdx = i / 4;
+        int byteInWord = i % 4; // 0=MSB, 3=LSB within word
+        uchar xb = (uchar)((x.v[wordIdx] >> ((3 - byteInWord) * 8)) & 0xff);
+        if(xb != target[i + 1]) return false;
     }
     return true;
 }
@@ -285,6 +285,7 @@ __kernel void cyclone_check_batch_thread_gpu(
         chain[(i - 1) * dim + gid] = inverse;
     }
 
+    // Work-group collective inversion
     loc_factors[lid] = inverse;
     barrier(CLK_LOCAL_MEM_FENCE);
     if(lid == 0) {
