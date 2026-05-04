@@ -50,6 +50,8 @@ static inline ulong xoshiro_next(__global xoshiro_state_t* state)
 
 static inline unsigned int getKeyByte(uint256_t key, int byteIndex)
 {
+    // Scalar logic: v[7] is MSB word, v[0] is LSB word.
+    // Each word is Little-Endian bytes: byte 0 is (v >> 0)
     return (key.v[7 - (byteIndex / 4)] >> ((byteIndex & 3) * 8)) & 0xff;
 }
 
@@ -161,6 +163,7 @@ static inline bool compressedPrefixMatches(uint256_t x, uint256_t y, __constant 
     for(int i = 0; i < prefixLen - 1; i++) {
         int wordIdx = i / 4;
         int byteInWord = i % 4; // 0=MSB, 3=LSB within word
+        // Coordinate logic: v[0] is MSB word, each word is Big-Endian
         uchar xb = (uchar)((x.v[wordIdx] >> ((3 - byteInWord) * 8)) & 0xff);
         if(xb != target[i + 1]) return false;
     }
@@ -174,6 +177,7 @@ static inline bool xPrefixMatches(uint256_t x, __constant const uchar* target, i
     int tailBytes = xBytes & 3;
 
     for(int i = 0; i < fullWords; i++) {
+        // Construct targetWord in Big-endian order to match x.v[i]
         uint targetWord = ((uint)target[1 + i * 4] << 24) | ((uint)target[2 + i * 4] << 16) | ((uint)target[3 + i * 4] << 8) | (uint)target[4 + i * 4];
         if(x.v[i] != targetWord) return false;
     }
@@ -190,13 +194,24 @@ static inline bool xPrefixMatches(uint256_t x, __constant const uchar* target, i
     return true;
 }
 
+static inline bool compressedFullMatches(uint256_t x, uint256_t y, __constant const uchar* target)
+{
+    return compressedPrefixMatches(x, y, target, 33);
+}
+
 static inline void storeMatchResult(uint256_t privKey, uint256_t x, uint256_t y, __constant const uchar* targetPrefix, __global cyclone_result_t* result)
 {
-    // Simplified: always store if flag is 0 or 1
-    if(atomic_cmpxchg((volatile __global unsigned int*)&result->flag, 0u, 2u) == 0u || result->flag == 1u) {
+    if(compressedFullMatches(x, y, targetPrefix)) {
+        atomic_xchg((volatile __global unsigned int*)&result->flag, 2u);
         result->privKey = privKey;
         result->x = x;
         result->y = y;
+    } else {
+        if(atomic_cmpxchg((volatile __global unsigned int*)&result->flag, 0u, 1u) == 0u) {
+            result->privKey = privKey;
+            result->x = x;
+            result->y = y;
+        }
     }
 }
 
@@ -285,7 +300,6 @@ __kernel void cyclone_check_batch_thread_gpu(
         chain[(i - 1) * dim + gid] = inverse;
     }
 
-    // Work-group collective inversion
     loc_factors[lid] = inverse;
     barrier(CLK_LOCAL_MEM_FENCE);
     if(lid == 0) {
